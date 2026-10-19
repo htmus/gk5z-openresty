@@ -20,7 +20,7 @@ For the full architectural format specification, byte-string breakdowns, and int
 This repository is organized by target OpenResty release branches. Navigate to the specific directory below to find compatible core C-patches, extension modules, automated build tools, and production-ready configuration stubs:
 
 * [📂 OpenResty 1.27.1.2 + OpenSSL 3.4.1](./1.27.1.2/) — **Stable LTS Branch (GK5Z v1.0)**
-* 📂 OpenResty 1.31.1.1 + OpenSSL 3.5.6 — *Coming Soon (Production Testing Stage)*
+* 📂 OpenResty 1.31.1.1 + OpenSSL 3.5.6 — *Mañana Stage (Pending community interest)*
 
 ---
 

@@ -21,21 +21,21 @@ All complex scoring, thresholds, and banning logic should be implemented on the 
 This repository is organized by OpenResty release versions. Navigate to the specific directory to find compatible patches, modules, and configuration examples.
 
 ```text
-.
-1.27.1.2/                      # Target directory for OpenResty 1.27.1.2 + OpenSSL 3.4.1
-├── patches/                   # Core C-patches for OpenSSL and Nginx core
-│   ├── openssl_3.4.1.patch
-│   └── openresty_1.27.1.2.nginx.patch
-├── modules/                   # Reference C-modules for metrics & export
-│   ├── ngx_http_gk5z_module.c     - Fingerprint calculation engine
-│   ├── ngx_http_gkstat_module.c   - In-memory metrics & SHM aggregation
-│   └── ngx_http_redis_pool.c      - Lock-free reference Redis connection pool
-├── config-examples/           # Production-ready configuration deployment stubs
-│   ├── nginx.conf
-│   └── gtk.conf
-├── utils/                     # helper utilites
-│   └── openresty.build.sh     # automatic build script for openresty.
-└── readme.md                  # Version-specific installation guide
+
+├── 1.27.1.2/                      # Stable production release. Target directory for OpenResty 1.27.1.2 + OpenSSL 3.4.1
+│   ├── patches/                   # Core C-patches for OpenSSL and Nginx core
+│   │   ├── openssl_3.4.1.patch
+│   │   └── openresty_1.27.1.2.nginx.patch
+│   ├── modules/                   # Reference C-modules for metrics & export
+│   │   ├── ngx_http_gk5z_module.c     - Fingerprint calculation engine
+│   │   ├── ngx_http_gkstat_module.c   - In-memory metrics & SHM aggregation
+│   │   └── ngx_http_redis_pool.c      - Lock-free reference Redis connection pool
+│   ├── config-examples/           # Production-ready configuration deployment stubs
+│   │   ├── nginx.conf
+│   │   └── gtk.conf
+│   ├── utils/                     # helper utilites
+│   │    └── openresty.build.sh    # automatic build script for openresty.
+│   └── readme.md                  # Version-specific installation guide
 ```
 
 ---
