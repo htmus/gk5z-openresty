@@ -1,0 +1,826 @@
+--- ./bundle/ngx_lua-0.10.28/src/api/ngx_http_lua_api.h.orig
++++ ./bundle/ngx_lua-0.10.28/src/api/ngx_http_lua_api.h	2026-10-19 17:38:32.648208326 +0300
+@@ -70,6 +70,34 @@
+ 
+ int ngx_http_lua_get_lua_http10_buffering(ngx_http_request_t *r);
+ 
++// -------------- новые экспортные функции -------------------
++int ngx_http_lua_ffi_shdict_store(ngx_shm_zone_t *zone, int op, u_char *key,
++    size_t key_len, int value_type, u_char *str_value_buf,
++    size_t str_value_len, double num_value, long exptime, int user_flags,
++    char **errmsg, int *forcible);
++
++int ngx_http_lua_ffi_shdict_incr(ngx_shm_zone_t *zone, u_char *key,
++    size_t key_len, double *value, char **err, int has_init, double init,
++    long init_ttl, int *forcible);
++
++int ngx_http_lua_ffi_shdict_flush_all(ngx_shm_zone_t *zone);
++
++long ngx_http_lua_ffi_shdict_get_ttl(ngx_shm_zone_t *zone, u_char *key,
++    size_t key_len);
++
++int ngx_http_lua_ffi_shdict_set_expire(ngx_shm_zone_t *zone, u_char *key,
++    size_t key_len, long exptime);
++
++size_t ngx_http_lua_ffi_shdict_capacity(ngx_shm_zone_t *zone);
++
++
++// In ngx_http_lua_api.h
++// Returns the number of elements found or NGX_ERROR.
++// The result (Lua table) will be on the top of the L stack.
++int ngx_http_lua_shdict_get_by_prefix(ngx_shm_zone_t *zone, u_char *prefix_data, 
++                                      size_t prefix_len, lua_State *L);
++//------------------------------------------------------------
++
+ 
+ #endif /* _NGX_HTTP_LUA_API_H_INCLUDED_ */
+ 
+--- ./bundle/ngx_lua-0.10.28/src/ngx_http_lua_shdict.c.orig
++++ ./bundle/ngx_lua-0.10.28/src/ngx_http_lua_shdict.c	2026-10-19 17:44:36.876952124 +0300
+@@ -29,8 +29,9 @@
+ static int ngx_http_lua_shdict_rpop(lua_State *L);
+ static int ngx_http_lua_shdict_pop_helper(lua_State *L, int flags);
+ static int ngx_http_lua_shdict_llen(lua_State *L);
+-
+-
++//--------------------
++static int ngx_http_lua_shdict_get_by_prefix_wrapper(lua_State *L);
++//--------------------
+ static ngx_inline ngx_shm_zone_t *ngx_http_lua_shdict_get_zone(lua_State *L,
+     int index);
+ 
+@@ -343,6 +344,11 @@
+         lua_pushvalue(L, -1); /* shared mt mt */
+         lua_setfield(L, -2, "__index"); /* shared mt */
+ 
++       // ---------- Our new feature --------------------
++        lua_pushcfunction(L, ngx_http_lua_shdict_get_by_prefix_wrapper); // Need a wrapper
++        lua_setfield(L, -2, "get_by_prefix");
++       //---------------------------------------------------
++
+         zone = lmcf->shdict_zones->elts;
+ 
+         for (i = 0; i < lmcf->shdict_zones->nelts; i++) {
+@@ -2074,6 +2080,111 @@
+ }
+ 
+ 
++//------------------------------- Added Features ------------------------
++// Auxiliary recursive function
++static void
++ngx_http_lua_shdict_rbtree_walk(ngx_rbtree_node_t *node, ngx_rbtree_node_t *sentinel,
++                                u_char *prefix, size_t prefix_len, lua_State *L)
++{
++    if (node == sentinel) {
++        return;
++    }
++    
++    // Recursively traverse the left subtree
++    ngx_http_lua_shdict_rbtree_walk(node->left, sentinel, prefix, prefix_len, L);
++
++    // --- Processing the current node ---
++    ngx_http_lua_shdict_node_t *sd = (ngx_http_lua_shdict_node_t *) &node->color;
++
++    // 1. Check if the key matches our prefix
++    if (sd->key_len > prefix_len && ngx_strncmp(sd->data, prefix, prefix_len) == 0) {
++        
++        // 2. The key matched! Extract the "tail" (the anomaly code).
++        const char *reason_str = (const char *)(sd->data + prefix_len);
++        // Convert the string to a number
++        long reason_id = atol(reason_str);
++
++        // 3. Extract the value (the counter, which is stored as a double)
++        double count;
++        ngx_memcpy(&count, sd->data + sd->key_len, sizeof(double));
++
++        // 4. Put the pair (reason_id, count) into the Lua table on the stack
++        lua_pushinteger(L, reason_id); // key
++        lua_pushnumber(L, count);      // value
++        lua_settable(L, -3);           // table[key] = value
++    }
++
++    // Recursively traverse the right subtree
++    ngx_http_lua_shdict_rbtree_walk(node->right, sentinel, prefix, prefix_len, L);
++}
++//------------------------
++// Main API function
++int
++ngx_http_lua_shdict_get_by_prefix(ngx_shm_zone_t *zone, u_char *prefix_data, 
++                                  size_t prefix_len, lua_State *L)
++{
++    ngx_http_lua_shdict_ctx_t *ctx = zone->data;
++
++    // 1. We create an empty table on the Lua stack where we will store the results.
++    lua_newtable(L);
++
++    ngx_shmtx_lock(&ctx->shpool->mutex);
++
++    // 2. We start a recursive traversal of the entire tree.
++    ngx_http_lua_shdict_rbtree_walk(ctx->sh->rbtree.root, ctx->sh->rbtree.sentinel,
++                                    prefix_data, prefix_len, L);
++
++    ngx_shmtx_unlock(&ctx->shpool->mutex);
++    
++    // The results table is now on top of the stack
++    return NGX_OK; 
++}
++//------------------------
++// This function will be called directly from Lua
++static int
++ngx_http_lua_shdict_get_by_prefix_wrapper(lua_State *L)
++{
++    ngx_shm_zone_t  *zone;
++    u_char          *prefix_data;
++    size_t           prefix_len;
++    int              n;
++
++    n = lua_gettop(L);
++    if (n != 2) {
++        // We expect 2 arguments: a shdict table and a prefix string.
++        return luaL_error(L, "expecting 2 arguments (shdict, prefix), but saw %d", n);
++    }
++
++    // Argument 1: shdict table
++    if (lua_type(L, 1) != LUA_TTABLE) {
++        return luaL_error(L, "bad \"zone\" argument, expected a table");
++    }
++
++    // Argument 2: prefix
++    prefix_data = (u_char *) luaL_checklstring(L, 2, &prefix_len);
++    if (prefix_len == 0) {
++        lua_newtable(L); // Return an empty table if the prefix is ​​empty
++        return 1;
++    }
++
++    // --- Converting arguments to C types ---
++    
++    // We get a pointer to shm_zone from the Lua table (this is a standard trick in ngx_lua)
++    zone = ngx_http_lua_shdict_get_zone(L, 1);
++    if (zone == NULL) {
++        return luaL_error(L, "failed to get shm zone from the shdict table");
++    }
++
++    // --- Calling our main C function ---
++    
++    // Our C function will automatically push the result (table) onto the top of the stack.
++    ngx_http_lua_shdict_get_by_prefix(zone, prefix_data, prefix_len, L);
++
++    // We return 1 to the Lua machine because our function left 1 value (table) on the stack.
++    return 1; 
++}
++//----------------------------------------------------------------------------
++
+ #if (nginx_version >= 1011007)
+ size_t
+ ngx_http_lua_ffi_shdict_free_space(ngx_shm_zone_t *zone)
+--- ./bundle/nginx-1.27.1/src/event/ngx_event_openssl.c.orig
++++ ./bundle/nginx-1.27.1/src/event/ngx_event_openssl.c	2026-10-19 17:45:05.896046993 +0300
+@@ -1,4 +1,3 @@
+-
+ /*
+  * Copyright (C) Igor Sysoev
+  * Copyright (C) Nginx, Inc.
+@@ -9,15 +8,17 @@
+ #include <ngx_core.h>
+ #include <ngx_event.h>
+ 
++// --------------------- new -----------------------
++#include <openssl/ssl.h>
++#include <openssl/sha.h>
++//--------------------------------------------------
+ 
+ #define NGX_SSL_PASSWORD_BUFFER_SIZE  4096
+ 
+-
+ typedef struct {
+     ngx_uint_t  engine;   /* unsigned  engine:1; */
+ } ngx_openssl_conf_t;
+ 
+-
+ static X509 *ngx_ssl_load_certificate(ngx_pool_t *pool, char **err,
+     ngx_str_t *cert, STACK_OF(X509) **chain);
+ static EVP_PKEY *ngx_ssl_load_certificate_key(ngx_pool_t *pool, char **err,
+@@ -1792,8 +1793,345 @@
+ 
+     return NGX_OK;
+ }
++//---------------------------------------
++// adds ciphers to the ssl object for gk5z fingerprint
++ngx_int_t
++ngx_SSL_client_features(ngx_connection_t *c) {
++
++    SSL *s = NULL;
++
++    if (c == NULL) {
++        return NGX_ERROR;
++    }
++    s = c->ssl->connection;
++
++    if (!SSL_is_server(s)) {
++        return NGX_OK;
++    }
++
++    ngx_uint_t MAX_CIPHERS = 255;
++    uint16_t tmp_ciphers[MAX_CIPHERS];
++    ngx_uint_t real_cipher_count = 0;
++
++    STACK_OF(SSL_CIPHER) *_ciphers = SSL_get_client_ciphers(s);
++
++    if (_ciphers == NULL) {
++        ngx_log_error(NGX_LOG_ERR, c->log, 0, "ssl_features: failed to get client ciphers");
++        return NGX_ERROR;
++    }
++
++    ngx_uint_t total = sk_SSL_CIPHER_num(_ciphers);
++
++    ngx_log_debug1(NGX_LOG_DEBUG_EVENT, c->log, 0, "ssl_features: chiphers total=%d", total);
++
++    for (ngx_uint_t i = 0; i < total && real_cipher_count < MAX_CIPHERS; i++) {
++        const SSL_CIPHER *cipher = sk_SSL_CIPHER_value(_ciphers, i);
++        if (cipher == NULL) {
++            continue;
++        }
++
++        uint32_t cipher_id = SSL_CIPHER_get_id(cipher);
++        uint16_t cipher_code = (uint16_t)(cipher_id & 0xFFFF);
++
++        tmp_ciphers[real_cipher_count] = cipher_code;
++        real_cipher_count++;
++    }
++
++    ngx_log_debug1(NGX_LOG_DEBUG_EVENT, c->log, 0, "ssl_features: real_cipher_count=%d", real_cipher_count);
++
++    c->ssl->ciph = ngx_pnalloc(c->pool, real_cipher_count * sizeof(uint16_t));
++    if (c->ssl->ciph == NULL) {
++        ngx_log_error(NGX_LOG_ERR, c->log, 0, "ssl_features: can't allocate memory for c->ssl->ciph");
++        return NGX_ERROR;
++    }
++
++    ngx_memzero(c->ssl->ciph, real_cipher_count * sizeof(uint16_t));
++    ngx_memcpy(c->ssl->ciph, tmp_ciphers, real_cipher_count * sizeof(uint16_t));
++
++    c->ssl->ciph_sz = real_cipher_count;
++
++    ngx_log_debug0(NGX_LOG_DEBUG_EVENT, c->log, 0, "ssl_features: fuinction done.");
++
++    int _num_sigalgs = SSL_get_sigalgs(s, 0, NULL, NULL, NULL, NULL, NULL);
++    if (_num_sigalgs <= 0) {
++        c->ssl->sglgs_sz = 0;
++        c->ssl->sglgs = NULL;
++        return NGX_OK;
++    }
++
++    uint16_t *sigalgs = ngx_pnalloc(c->pool, _num_sigalgs * sizeof(uint16_t));
++    if (sigalgs == NULL) {
++        ngx_log_error(NGX_LOG_ERR, c->log, 0, 
++                      "Failed to allocate memory for signature algorithms");
++        return NGX_ERROR;
++    }
++
++    for (int i = 0; i < _num_sigalgs; i++) {
++        int sign, hash, signhash;
++        unsigned char rsig, rhash;
++        SSL_get_sigalgs(s, i, &sign, &hash, &signhash, &rsig, &rhash);
++
++        sigalgs[i] = (uint16_t)((rhash << 8) | rsig);
++    }
++
++    c->ssl->sglgs = sigalgs;
++    c->ssl->sglgs_sz = (size_t)_num_sigalgs;
++
++    return NGX_OK;
++}
++// adds extensions to the ssl object for gk5z fingerprint
++//-----------------------------------------------------------------
++int
++ngx_SSL_early_cb_fn(SSL *s, int *al, void *arg)
++{
++    int               *ext_out;
++    size_t             ext_len;
++    int                ret;
++
++    ngx_ssl_client_hello_chain_t *chain = (ngx_ssl_client_hello_chain_t *)arg;
++    ngx_connection_t *c = chain->c;
++    int rc = 1;
++
++    c->ssl->extn_sz = 0;
++    c->ssl->extn = NULL;
++
++    ret = ossl_ch_extract_extlist(s, &ext_out, &ext_len);
++    if (!ret || !ext_out || !ext_len) {
++        ngx_log_error(NGX_LOG_WARN, c->log, 0, "ngx_SSL_early_cb_fn: Failed to get ClientHello extensions in early_cb");
++        return 1;
++    }
++
++    if (ext_out && ext_len > 0) {
++        c->ssl->extn = ngx_palloc(c->pool, sizeof(char *) * ext_len);
++        if (c->ssl->extn) {
++            c->ssl->extn_sz = ext_len;
++            c->ssl->extn = ngx_palloc(c->pool, ext_len * sizeof(uint16_t));
++            ngx_memzero(c->ssl->extn,ext_len * sizeof(uint16_t));
++            if (c->ssl->extn) {
++                for (size_t i = 0; i < ext_len; i++) {
++                    c->ssl->extn[i] = ext_out[i];
++                }
++            } else {
++                c->ssl->extn_sz = 0;
++            }
+ 
++        }
++    }
++    OPENSSL_free(ext_out);
+ 
++    int alpn_found = 0;
++    for (size_t i = 0; i < ext_len; i++) {
++        if (ext_out[i] == 0x0010) {
++            alpn_found = 1;
++            break;
++        }
++    }
++
++    if (alpn_found && c->ssl->client_alpns == NULL) {
++        const unsigned char *alpn_data;
++        size_t alpn_len;
++        if (SSL_client_hello_get0_ext(s, 0x0010, &alpn_data, &alpn_len)) {
++            const unsigned char *p = alpn_data;
++            const unsigned char *end = alpn_data + alpn_len;
++            if (p + 2 <= end) {
++                size_t alpn_list_len = (p[0] << 8) + p[1];
++                p += 2;
++                if (p + alpn_list_len <= end) {
++                    size_t total_len = 0;
++                    const unsigned char *start = p;
++                    while (p < end) {
++                        if (p + 1 > end) break;
++                        size_t len = *p++;
++                        if (p + len > end) break;
++                        total_len += len + 1;
++                        p += len;
++                    }
++                    if (total_len > 0) {
++                        c->ssl->client_alpns = ngx_palloc(c->pool, total_len + 1);
++                        if (c->ssl->client_alpns) {
++                            p = start;
++                            size_t pos = 0;
++                            while (p < end) {
++                                if (p + 1 > end) break;
++                                size_t len = *p++;
++                                if (p + len > end) break;
++                                if (pos > 0) {
++                                    c->ssl->client_alpns[pos++] = ',';
++                                }
++                                ngx_memcpy(c->ssl->client_alpns + pos, p, len);
++                                pos += len;
++                                p += len;
++                            }
++                            c->ssl->client_alpns[pos] = '\0';
++                            ngx_log_debug(NGX_LOG_INFO, c->log, 0, "ngx_SSL_early_cb_fn: Early CB: ALPN list extracted: %s", c->ssl->client_alpns);
++                        }
++                    }
++                }
++            }
++        }
++    }
++
++    const unsigned char *data;
++    size_t len;
++
++    len = SSL_client_hello_get0_compression_methods(s, &data);
++    if (len > 0) {
++        c->ssl->compr_mt = ngx_palloc(c->pool, len);
++        if (c->ssl->compr_mt == NULL) {
++            ngx_log_error(NGX_LOG_ERR, c->log, 0, 
++                          "ngx_SSL_early_cb_fn: failed to allocate compression methods");
++            *al = SSL_AD_INTERNAL_ERROR;
++            return SSL_CLIENT_HELLO_ERROR;
++        }
++        ngx_memcpy(c->ssl->compr_mt, data, len);
++        c->ssl->compr_mt_sz = len;
++    } else {
++        c->ssl->compr_mt = NULL;
++        c->ssl->compr_mt_sz = 0;
++    }    
++//Supproted versions
++    if (SSL_client_hello_get0_ext(s, TLSEXT_TYPE_supported_versions, &data, &len)) {
++        if (len > 1 && data[0] == len - 1) {
++            size_t num_versions = data[0] / 2;
++            c->ssl->supp_vers = ngx_palloc(c->pool, num_versions * sizeof(uint16_t));
++            if (c->ssl->supp_vers == NULL) {
++                ngx_log_error(NGX_LOG_ERR, c->log, 0, 
++                              "ngx_SSL_early_cb_fn: failed to allocate supported versions");
++                *al = SSL_AD_INTERNAL_ERROR;
++                return SSL_CLIENT_HELLO_ERROR;
++            }
++            c->ssl->supp_vers_sz = num_versions;
++
++            for (size_t i = 0; i < num_versions; i++) {
++                c->ssl->supp_vers[i] = (data[1 + i * 2] << 8) | data[2 + i * 2];
++            }
++        } else {
++            c->ssl->supp_vers = NULL;
++            c->ssl->supp_vers_sz = 0;
++            ngx_log_debug(NGX_LOG_DEBUG_EVENT, c->log, 0, "ngx_SSL_early_cb_fn: invalid supported versions");
++        }
++    } else {
++        c->ssl->supp_vers = NULL;
++        c->ssl->supp_vers_sz = 0;
++        ngx_log_debug(NGX_LOG_DEBUG_EVENT, c->log, 0, "ngx_SSL_early_cb_fn: no supported versions");
++    }
++// Supported Groups
++    if (SSL_client_hello_get0_ext(s, TLSEXT_TYPE_supported_groups, &data, &len)) {
++        if (len > 2 && (size_t)(data[0] << 8 | data[1]) == len - 2) {
++            size_t num_groups = (len - 2) / 2;
++            c->ssl->supp_groups = ngx_palloc(c->pool, num_groups * sizeof(uint16_t));
++            if (c->ssl->supp_groups == NULL) {
++                ngx_log_error(NGX_LOG_ERR, c->log, 0, "ngx_SSL_early_cb_fn: failed to allocate supported groups");
++                *al = SSL_AD_INTERNAL_ERROR;
++                return SSL_CLIENT_HELLO_ERROR;
++            }
++            c->ssl->supp_groups_sz = num_groups;
++
++            for (size_t i = 0; i < num_groups; i++) {
++                c->ssl->supp_groups[i] = (data[2 + i * 2] << 8) | data[3 + i * 2];
++            }
++
++        } else {
++            c->ssl->supp_groups = NULL;
++            c->ssl->supp_groups_sz = 0;
++            ngx_log_error(NGX_LOG_ERR, c->log, 0, "ngx_SSL_early_cb_fn: invalid supported groups");
++        }
++    } else {
++        c->ssl->supp_groups = NULL;
++        c->ssl->supp_groups_sz = 0;
++        ngx_log_debug(NGX_LOG_DEBUG_EVENT, c->log, 0, "ngx_SSL_early_cb_fn: no supported groups");
++    }
++// Padding
++    if (SSL_client_hello_get0_ext(s, TLSEXT_TYPE_padding, &data, &len)) {
++
++        size_t i;
++        for (i = 0; i < len; i++) {
++            if (data[i] != 0x00) {
++                ngx_log_error(NGX_LOG_ERR, c->log, 0, "ngx_SSL_early_cb_fn: invalid padding data");
++                *al = SSL_AD_ILLEGAL_PARAMETER;
++                return SSL_CLIENT_HELLO_ERROR;
++            }
++        }
++        c->ssl->padding_len = len;
++    } else {
++        c->ssl->padding_len = 0;
++    }
++// PSK Modes
++    if (SSL_client_hello_get0_ext(s, TLSEXT_TYPE_psk_kex_modes, &data, &len)) {
++        if (len > 1 && data[0] == len - 1) { // Проверяем формат: [len, mode1, mode2, ...]
++            size_t num_modes = data[0];
++            c->ssl->psk_modes = ngx_palloc(c->pool, num_modes);
++            if (c->ssl->psk_modes == NULL) {
++                ngx_log_error(NGX_LOG_ERR, c->log, 0, "ngx_SSL_early_cb_fn: failed to allocate psk modes");
++                *al = SSL_AD_INTERNAL_ERROR;
++                return SSL_CLIENT_HELLO_ERROR;
++            }
++            c->ssl->psk_modes_sz = num_modes;
++            ngx_memcpy(c->ssl->psk_modes, data + 1, num_modes);
++
++        } else {
++            c->ssl->psk_modes = NULL;
++            c->ssl->psk_modes_sz = 0;
++            ngx_log_error(NGX_LOG_ERR, c->log, 0, "ngx_SSL_early_cb_fn: invalid psk modes");
++        }
++    } else {
++        c->ssl->psk_modes = NULL;
++        c->ssl->psk_modes_sz = 0;
++    }
++
++//#ifdef __INTELLISENSE__  // This macro is defined only for the VSCode parser.
++#ifndef TLSEXT_TYPE_record_size_limit
++#define TLSEXT_TYPE_record_size_limit 28
++#endif
++//#endif
++
++// Record Size Limit
++    if (SSL_client_hello_get0_ext(s, TLSEXT_TYPE_record_size_limit, &data, &len)) {
++        if (len == 2) {
++            c->ssl->record_size_limit = (data[0] << 8) | data[1];
++            if (c->ssl->record_size_limit < 64 || c->ssl->record_size_limit > 16385) {
++                ngx_log_error(NGX_LOG_ERR, c->log, 0, "ngx_SSL_early_cb_fn: invalid record_size_limit: %ud", c->ssl->record_size_limit);
++            }
++        } else {
++            c->ssl->record_size_limit = 0;
++            ngx_log_error(NGX_LOG_ERR, c->log, 0, "ngx_SSL_early_cb_fn: invalid record_size_limit length: %ud", len);
++        }
++    } else {
++        c->ssl->record_size_limit = 0;
++    }
++
++    if (chain->original_cb) {
++        rc = chain->original_cb(s, al, chain->original_cb_arg);
++    }
++
++    return rc;    
++}
++//-----------------------------------------------------------------
++
++static void
++get_ip_binary_from_connection(ngx_connection_t *c, ngx_anomaly_entry_t *entry)
++{
++    struct sockaddr_in  *sin;
++    struct sockaddr_in6 *sin6;
++
++    if (c == NULL || c->sockaddr == NULL || entry == NULL) {
++        entry->ip_type = 0;
++        return;
++    }
++
++    if (c->sockaddr->sa_family == AF_INET) {
++        sin = (struct sockaddr_in *)c->sockaddr;
++        entry->ip_type = 1;
++        entry->addr.v4 = sin->sin_addr.s_addr;
++    } else if (c->sockaddr->sa_family == AF_INET6) {
++        sin6 = (struct sockaddr_in6 *)c->sockaddr;
++        entry->ip_type = 2;
++        ngx_memcpy(entry->addr.v6, &sin6->sin6_addr, 16);
++    } else {
++        entry->ip_type = 0;
++    }
++}
++//-----------------------------------------------------------------
+ ngx_int_t
+ ngx_ssl_handshake(ngx_connection_t *c)
+ {
+@@ -1801,6 +2139,13 @@
+     ngx_err_t  err;
+     ngx_int_t  rc;
+ 
++    SSL_CTX   *ssl_ctx;
++
++    struct timeval start, end;
++    if (c->ssl->handshake_time_us == 0) {
++        gettimeofday(&start, NULL);
++    }
++//-------------------------------
+ #ifdef SSL_READ_EARLY_DATA_SUCCESS
+     if (c->ssl->try_early_data) {
+         return ngx_ssl_try_early_data(c);
+@@ -1811,14 +2156,40 @@
+         return ngx_ssl_ocsp_validate(c);
+     }
+ 
++    int (*original_client_hello_cb)(SSL *, int *, void *) = NULL;
++    void *original_client_hello_cb_arg = NULL;
++
+     ngx_ssl_clear_error(c->log);
+ 
++    ssl_ctx = c->ssl->session_ctx;
++
++    SSL_CTX_get_client_hello_cb(ssl_ctx, &original_client_hello_cb, &original_client_hello_cb_arg);
++
++    ngx_ssl_client_hello_chain_t chain;
++    chain.c = c;
++    chain.original_cb = original_client_hello_cb;
++    chain.original_cb_arg = original_client_hello_cb_arg;
++
++    // client hello callback function on the session context, gk5z extensions
++    SSL_CTX_set_client_hello_cb(c->ssl->session_ctx, ngx_SSL_early_cb_fn, &chain);
++
+     n = SSL_do_handshake(c->ssl->connection);
+ 
++    SSL_CTX_set_client_hello_cb(ssl_ctx, original_client_hello_cb, original_client_hello_cb_arg);    
++//-------------------------------
+     ngx_log_debug1(NGX_LOG_DEBUG_EVENT, c->log, 0, "SSL_do_handshake: %d", n);
+-
+     if (n == 1) {
+ 
++        gettimeofday(&end, NULL);
++        c->ssl->handshake_time_us =
++            (end.tv_sec - start.tv_sec) * 1000000 +
++            (end.tv_usec - start.tv_usec);
++
++        ngx_log_debug1(NGX_LOG_DEBUG_EVENT, c->log, 0,
++                       "SSL handshake time: %uL µs", c->ssl->handshake_time_us);            
++
++        ngx_SSL_client_features(c);
++
+         if (ngx_handle_read_event(c->read, 0) != NGX_OK) {
+             return NGX_ERROR;
+         }
+@@ -1914,6 +2285,129 @@
+         return NGX_AGAIN;
+     }
+ 
++    // ================== START OF BLOCK FOR COUNTING HELLO ERROR ==================
++
++    // If we're here, then there was a fatal SSL error.
++    // Let's check if we have access to our statistics module.
++    // Let's use the "dirty" method with a global pointer.
++
++#ifdef __INTELLISENSE__  // This macro is defined only for the VSCode parser.
++#ifndef SSL_R_MISSING_SUPPORTED_VERSIONS_EXTENSION
++#define SSL_R_MISSING_SUPPORTED_VERSIONS_EXTENSION 420
++#endif
++#endif
++    
++    extern ngx_shm_zone_t *ngx_gkstat_shm_zone_ptr;
++
++    if (ngx_gkstat_shm_zone_ptr != NULL && ngx_gkstat_shm_zone_ptr->data != NULL) {
++        
++        unsigned long e = ERR_peek_last_error();
++        int reason = ERR_GET_REASON(e);
++
++        switch (reason) {
++    /*
++     * Category 1: Fundamental Coordination Problems
++     * (The most common and reliable indicators of scanners and bots)
++     */
++            case SSL_R_NO_SHARED_CIPHER:
++            case SSL_R_UNSUPPORTED_PROTOCOL:
++            case SSL_R_WRONG_VERSION_NUMBER:
++            case SSL_R_BAD_PROTOCOL_VERSION_NUMBER:
++            case SSL_R_VERSION_TOO_LOW:
++            case SSL_R_TLSV1_ALERT_PROTOCOL_VERSION:
++    /*
++     * Category 2: Non-TLS traffic and severe format errors
++     * (We catch attempts to contact using the wrong protocol or just "garbage")
++     */
++            case SSL_R_HTTP_REQUEST:
++            case SSL_R_HTTPS_PROXY_REQUEST:
++            case SSL_R_UNKNOWN_PROTOCOL:
++            case SSL_R_BAD_PACKET:
++            case SSL_R_UNEXPECTED_EOF_WHILE_READING:
++            case SSL_R_LENGTH_TOO_SHORT:
++            case SSL_R_PACKET_LENGTH_TOO_LONG:
++            case SSL_R_EXCESSIVE_MESSAGE_SIZE:
++            case SSL_R_LENGTH_MISMATCH:
++            case SSL_R_WRONG_SSL_VERSION:
++    /*
++     * Category 3: Issues with ClientHello extensions and parameters
++     * (More subtle attacks that manipulate the contents of the handshake)
++     */
++            case SSL_R_PARSE_TLSEXT:
++            case SSL_R_BAD_EXTENSION:
++            case SSL_R_BAD_HELLO_REQUEST:
++            case SSL_R_FRAGMENTED_CLIENT_HELLO:
++            case SSL_R_UNSUPPORTED_COMPRESSION_ALGORITHM:
++            case SSL_R_WRONG_SIGNATURE_TYPE:
++            case SSL_R_MISSING_SUPPORTED_GROUPS_EXTENSION:
++            case SSL_R_MISSING_SUPPORTED_VERSIONS_EXTENSION:
++            case SSL_R_TLSV1_UNSUPPORTED_EXTENSION:
++            case SSL_R_TLSV13_ALERT_MISSING_EXTENSION:
++            case SSL_R_SSLV3_ALERT_ILLEGAL_PARAMETER:
++    /*
++     * Category 4: Errors related to TLS Alerts from the client
++     * (The client himself reports the problem, which is also an event)
++     */
++            case SSL_R_TLSV1_ALERT_DECODE_ERROR:
++            case SSL_R_SSLV3_ALERT_HANDSHAKE_FAILURE:
++            case SSL_R_SSLV3_ALERT_UNEXPECTED_MESSAGE:
++    /*
++     * Category 5: Noisy encryption/MAC related errors.
++     * They can be caused by network problems, but if they appear en masse, they are a sign of an attack.
++     * Analyze in Lua with caution!
++     */
++            case SSL_R_DECRYPTION_FAILED:
++            case SSL_R_DECRYPTION_FAILED_OR_BAD_RECORD_MAC:
++            case SSL_R_SSLV3_ALERT_BAD_RECORD_MAC:
++            case SSL_R_TLSV1_ALERT_DECRYPTION_FAILED:
++            case SSL_R_TLSV1_ALERT_DECRYPT_ERROR:
++            // If the reason is one of the above, increment the counter
++            {
++                ngx_http_gatekeeper_global_stats_t *stats;
++                ngx_anomaly_entry_t *entry;
++                ngx_uint_t pos;
++
++            // 1. Get a pointer to our main structure in SHM
++                stats = (ngx_http_gatekeeper_global_stats_t *)ngx_gkstat_shm_zone_ptr->data;
++                if (stats == NULL) {
++                // If SHM is unavailable for some reason, just exit
++                    break;
++                }
++
++            // 2. Increment the global error counter
++                (void)ngx_atomic_fetch_add(&stats->hello_error_count, 1);
++                (void)ngx_atomic_fetch_add(&stats->total_hello_error_count, 1);
++
++            // === WRITE TO RING BUFFER ===
++
++            // 3. Atomically get the position for writing and "wrap" it
++                pos = ngx_atomic_fetch_add(&stats->write_pos, 1);
++                pos %= ANOMALY_BUFFER_SIZE;
++
++            // 4. Get a pointer to the desired cell in the buffer
++                entry = &stats->buffer[pos];
++
++            // 5. Fill the cell with data
++                get_ip_binary_from_connection(c, entry);     // Getting IP
++                entry->reason = (uint16_t)reason;            // Saving the error code
++                entry->timestamp = ngx_current_msec;         // Saving time
++
++            // 6. Logging the event for debugging
++                ngx_log_debug2(NGX_LOG_DEBUG_EVENT, c->log, 0, 
++                               "gkstat: ClientHello anomaly logged, reason: %d, ip_type: %d",
++                               reason, entry->ip_type);
++            }
++            break;
++
++            default:
++                // The error occurred at another stage of the handshake, we will ignore it.
++                ngx_log_debug1(NGX_LOG_DEBUG_EVENT, c->log, 0,
++                               "gkstat: SSL error is not a ClientHello error, reason: %d", reason);
++                break;
++        }
++    }
++// =================== END OF BLOCK FOR COUNTING HELLO ERROR ===================
++    
+ #if OPENSSL_VERSION_NUMBER >= 0x10002000L
+     if (sslerr == SSL_ERROR_WANT_X509_LOOKUP
+ #   ifdef SSL_ERROR_PENDING_SESSION
+@@ -6140,3 +6634,4 @@
+ 
+ #endif
+ }
++//=========================================
+--- ./bundle/nginx-1.27.1/src/event/ngx_event_openssl.h.orig
++++ ./bundle/nginx-1.27.1/src/event/ngx_event_openssl.h	2026-10-19 17:46:02.858196096 +0300
+@@ -92,7 +92,6 @@
+     size_t                      buffer_size;
+ };
+ 
+-
+ struct ngx_ssl_connection_s {
+     ngx_ssl_conn_t             *connection;
+     SSL_CTX                    *session_ctx;
+@@ -128,8 +127,66 @@
+     unsigned                    in_ocsp:1;
+     unsigned                    early_preread:1;
+     unsigned                    write_blocked:1;
++
++//-------- new -----------------------
++    size_t           ciph_sz;            // Number of ciphers
++    uint16_t         *ciph;              // Cipher array
++    size_t           extn_sz;            // Number of extensions
++    uint16_t         *extn;              // Array of extensions
++    char             *client_alpns;      // Full list of client ALPNs
++    size_t           sglgs_sz;           // Number of algorithms
++    uint16_t         *sglgs;             // Array of algorithms
++    uint32_t         handshake_time_us;  // TLS handshake time in us.
++    size_t           compr_mt_sz;        // Number of compression methods
++    uint8_t          *compr_mt;          // Array of compression methods
++    size_t           supp_vers_sz;       // Number of supported versions
++    uint16_t         *supp_vers;         // Array of versions (2 bytes per version)
++    size_t           supp_groups_sz;     // Number of groups supported
++    uint16_t         *supp_groups;       // Array of groups (2 bytes per group)
++    size_t           padding_len;        // Padding length (in bytes)
++    size_t           psk_modes_sz;       // Number of PSK modes
++    uint8_t          *psk_modes;         // Array of mode codes
++    uint16_t         record_size_limit;  // Record Size Limit (0 if absent)
++//------------------------------------
+ };
+ 
++//-------- new -----------------------
++#define ANOMALY_BUFFER_SIZE 1024 // For example, we store the last 1024 anomalies
++
++typedef struct {
++    uint8_t  ip_type;           // 4 for IPv4, 6 for IPv6, 0 for unknown
++    uint16_t reason;            // SSL Error Code
++    // uint8_t  reserved[...];  // If alignment is needed
++    ngx_msec_t timestamp;       // Event time
++    
++    // We use union to store either IPv4 or IPv6
++    union {
++        uint32_t v4;        // For IPv4 (in network order)
++        uint8_t  v6[16];    // For IPv6 (in network order)
++    } addr;
++
++} ngx_anomaly_entry_t;
++
++typedef struct {                           // Structure for organizing counters
++    ngx_atomic_t hello_error_count;        // Number of ClientHello errors
++    ngx_atomic_t total_hello_error_count;  // Total number of ClientHello errors
++    ngx_atomic_t requests_cum;             // Total number of requests processed
++    ngx_atomic_t errors_4xx;               // Number of 4xx errors
++    ngx_atomic_t errors_5xx;               // Number of errors 5xx
++    ngx_atomic_t min_time_req;             // Minimum request processing time (in milliseconds)
++    ngx_atomic_t max_time_req;             // Maximum request processing time (in milliseconds)
++    // Our new ring buffer
++    ngx_atomic_t write_pos; // Position for next entry
++    ngx_atomic_t read_pos;  // Position for next reading
++    ngx_anomaly_entry_t buffer[ANOMALY_BUFFER_SIZE];    
++} ngx_http_gatekeeper_global_stats_t;
++
++typedef struct {                       // Structure for organizing the client_hello_cb call chain
++    ngx_connection_t  *c;
++    int (*original_cb)(SSL *s, int *al, void *arg);
++    void *original_cb_arg;
++} ngx_ssl_client_hello_chain_t;
++//------------------------------------
+ 
+ #define NGX_SSL_NO_SCACHE            -2
+ #define NGX_SSL_NONE_SCACHE          -3
+@@ -324,6 +381,9 @@
+     char *fmt, ...);
+ void ngx_ssl_cleanup_ctx(void *data);
+ 
++void ngx_ssl_gk5z_msg_callback(int write_p, int version, int content_type, const void *buf, size_t len, ngx_ssl_conn_t *ssl_conn, void *arg);
++
++void ngx_ssl_calculate_gk5z(ngx_connection_t *c);
+ 
+ extern int  ngx_ssl_connection_index;
+ extern int  ngx_ssl_server_conf_index;

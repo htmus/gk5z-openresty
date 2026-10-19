@@ -1,0 +1,220 @@
+--- ./include/openssl/tls1.h.orig
++++ ./include/openssl/tls1.h	2025-06-27 17:43:27.811218295 +0300
+@@ -94,6 +94,9 @@
+ /* ExtensionType values from RFC6091 */
+ # define TLSEXT_TYPE_cert_type           9
+ 
++/* ExtensionType value from RFC8449 */
++# define TLSEXT_TYPE_record_size_limit           28
++
+ /* ExtensionType values from RFC4492 */
+ /*
+  * Prior to TLSv1.3 the supported_groups extension was known as
+@@ -246,7 +249,8 @@
+ int SSL_CTX_set_tlsext_max_fragment_length(SSL_CTX *ctx, uint8_t mode);
+ int SSL_set_tlsext_max_fragment_length(SSL *ssl, uint8_t mode);
+ 
+-# define TLSEXT_MAXLEN_host_name 255
++# define TLSEXT_MAXLEN_host_name             255
++# define TLSEXT_MIN_RECORD_SIZE_LIMIT        64
+ 
+ __owur const char *SSL_get_servername(const SSL *s, const int type);
+ __owur int SSL_get_servername_type(const SSL *s);
+--- ./include/openssl/ssl.h.in.orig
++++ ./include/openssl/ssl.h.in	2025-07-03 16:05:48.655564071 +0300
+@@ -1895,8 +1895,11 @@
+ # define SSL_CLIENT_HELLO_RETRY   (-1)
+ 
+ typedef int (*SSL_client_hello_cb_fn) (SSL *s, int *al, void *arg);
++
+ void SSL_CTX_set_client_hello_cb(SSL_CTX *c, SSL_client_hello_cb_fn cb,
+                                  void *arg);
++void SSL_CTX_get_client_hello_cb(SSL_CTX *ctx,int (**cb)(SSL *, int *, void *),void **arg);
++
+ int SSL_client_hello_isv2(SSL *s);
+ unsigned int SSL_client_hello_get0_legacy_version(SSL *s);
+ size_t SSL_client_hello_get0_random(SSL *s, const unsigned char **out);
+@@ -1905,6 +1908,11 @@
+ size_t SSL_client_hello_get0_compression_methods(SSL *s,
+                                                  const unsigned char **out);
+ int SSL_client_hello_get1_extensions_present(SSL *s, int **out, size_t *outlen);
++//--------------
++const unsigned char *SSL_SESSION_get_ticket_id(const SSL_SESSION *s, size_t *len);
++int ossl_ch_extract_extlist(SSL *ssl, int **result, size_t *total);
++//--------------
++int ossl_ch_extract_extlist(SSL *ssl, int **result, size_t *total);
+ int SSL_client_hello_get_extension_order(SSL *s, uint16_t *exts,
+                                          size_t *num_exts);
+ int SSL_client_hello_get0_ext(SSL *s, unsigned int type,
+--- ./include/openssl/sslerr_legacy.h.orig
++++ ./include/openssl/sslerr_legacy.h	2025-06-27 17:43:27.811218295 +0300
+@@ -391,6 +391,7 @@
+ #  define SSL_F_TLS_PARSE_CTOS_MAXFRAGMENTLEN              0
+ #  define SSL_F_TLS_PARSE_CTOS_POST_HANDSHAKE_AUTH         0
+ #  define SSL_F_TLS_PARSE_CTOS_PSK                         0
++#  define SSL_F_TLS_PARSE_CTOS_RECORD_SIZE_LIMIT           0
+ #  define SSL_F_TLS_PARSE_CTOS_PSK_KEX_MODES               0
+ #  define SSL_F_TLS_PARSE_CTOS_RENEGOTIATE                 0
+ #  define SSL_F_TLS_PARSE_CTOS_SERVER_NAME                 0
+--- ./ssl/ssl_lib.c.orig
++++ ./ssl/ssl_lib.c	2026-10-19 16:59:39.720312964 +0300
+@@ -6600,7 +6600,68 @@
+         *out = sc->clienthello->compressions;
+     return sc->clienthello->compressions_len;
+ }
++//---------------------------------
++int ossl_ch_extract_extlist(SSL *ssl, int **result, size_t *total)
++{
++    const SSL_CONNECTION *conn = SSL_CONNECTION_FROM_SSL(ssl);
++    PACKET pkt = conn->clienthello->extensions;
++    size_t ext_count = 0, pos = 0;
++    int *list;
++
++    while (PACKET_remaining(&pkt) > 0) {
++        unsigned int t;
++        PACKET tmp;
++        if (!PACKET_get_net_2(&pkt, &t) || !PACKET_get_length_prefixed_2(&pkt, &tmp))
++            return 0;
++        ++ext_count;
++    }
++
++    list = OPENSSL_malloc(sizeof(int) * ext_count);
++    if (list == NULL)
++        return 0;
++
++    pkt = conn->clienthello->extensions;
++    while (PACKET_remaining(&pkt) > 0 && pos < ext_count) {
++        unsigned int t;
++        PACKET tmp;
++        if (!PACKET_get_net_2(&pkt, &t) || !PACKET_get_length_prefixed_2(&pkt, &tmp)) {
++            OPENSSL_free(list);
++            return 0;
++        }
++        list[pos++] = (int)t;
++    }
++
++    *result = list;
++    *total = ext_count;
++    return 1;
++}
++//---------------------------------
++const unsigned char *SSL_SESSION_get_ticket_id(const SSL_SESSION *s, size_t *len) {
++    if (s == NULL || s->ext.tick == NULL || s->ext.ticklen < 16) {
++        if (len != NULL)
++            *len = 0;
++        return NULL;
++    }
+ 
++    if (len != NULL)
++        *len = 16;
++
++    return s->ext.tick;
++}
++//---------------------------------
++void SSL_CTX_get_client_hello_cb(SSL_CTX *ctx,
++                                 int (**cb)(SSL *, int *, void *),
++                                 void **arg)
++{
++    if (ctx == NULL)
++        return;
++
++    if (cb != NULL)
++        *cb = ctx->client_hello_cb;
++    if (arg != NULL)
++        *arg = ctx->client_hello_cb_arg;
++}
++//---------------------------------
+ int SSL_client_hello_get1_extensions_present(SSL *s, int **out, size_t *outlen)
+ {
+     RAW_EXTENSION *ext;
+--- ./ssl/ssl_local.h.orig
++++ ./ssl/ssl_local.h	2025-06-27 17:43:27.812218318 +0300
+@@ -1760,6 +1760,8 @@
+     ASYNC_WAIT_CTX *waitctx;
+     size_t asyncrw;
+ 
++    unsigned int record_size_limit; /* RFC 8449 record size limit */
++
+     /*
+      * The maximum number of bytes advertised in session tickets that can be
+      * sent as early data.
+--- ./ssl/statem/extensions_cust.c.orig
++++ ./ssl/statem/extensions_cust.c	2025-06-19 17:36:00.000000000 +0300
+@@ -517,7 +517,10 @@
+ #endif
+     case TLSEXT_TYPE_padding:
+     case TLSEXT_TYPE_renegotiate:
++//---------------------
+     case TLSEXT_TYPE_max_fragment_length:
++//---------------------
++    case TLSEXT_TYPE_record_size_limit:
+     case TLSEXT_TYPE_server_name:
+     case TLSEXT_TYPE_session_ticket:
+     case TLSEXT_TYPE_signature_algorithms:
+--- ./ssl/statem/statem_local.h.orig
++++ ./ssl/statem/statem_local.h	2025-06-19 02:40:49.000000000 +0300
+@@ -278,6 +278,10 @@
+                              SSL_SESSION *sess, int sign, int external);
+ 
+ /* Server Extension processing */
++//------------------------
++int tls_parse_ctos_record_size_limit(SSL_CONNECTION *s, PACKET *pkt, unsigned int context,
++                               X509 *x, size_t chainidx);
++//------------------------
+ int tls_parse_ctos_renegotiate(SSL_CONNECTION *s, PACKET *pkt,
+                                unsigned int context,
+                                X509 *x, size_t chainidx);
+--- ./ssl/statem/extensions.c.orig
++++ ./ssl/statem/extensions.c	2026-10-19 16:59:02.470929577 +0300
+@@ -404,6 +404,15 @@
+         tls_construct_stoc_early_data, tls_construct_ctos_early_data,
+         final_early_data
+     },
++//------------------------
++    {
++        TLSEXT_TYPE_record_size_limit,
++        SSL_EXT_CLIENT_HELLO | SSL_EXT_TLS1_3_ONLY,
++        NULL, tls_parse_ctos_record_size_limit, NULL,
++        NULL, NULL,
++        NULL
++    },
++//-----------------------
+     {
+         TLSEXT_TYPE_certificate_authorities,
+         SSL_EXT_CLIENT_HELLO | SSL_EXT_TLS1_3_CERTIFICATE_REQUEST
+@@ -588,6 +597,35 @@
+     return 1;
+ }
+ 
++
++//-----------------------------
++int tls_parse_ctos_record_size_limit(SSL_CONNECTION *s, PACKET *pkt, unsigned int context,
++                                     X509 *x, size_t chainidx)
++{
++
++    unsigned int limit;
++    size_t remaining;
++
++    remaining = PACKET_remaining(pkt);
++    if (remaining < 2) {
++        SSLfatal_data(s, SSL_AD_DECODE_ERROR, SSL_F_TLS_PARSE_CTOS_RECORD_SIZE_LIMIT,
++                      "Record size limit extension too short");
++        return 0;
++    }
++
++    if (!PACKET_get_net_2(pkt, &limit)) {
++        SSLfatal_data(s, SSL_AD_DECODE_ERROR, SSL_F_TLS_PARSE_CTOS_RECORD_SIZE_LIMIT,
++                      "Bad extension data");
++        return 0;
++    }
++
++    s->record_size_limit = limit;
++
++    return 1;
++}
++//-----------------------------
++
++
+ /*
+  * Gather a list of all the extensions from the data in |packet]. |context|
+  * tells us which message this extension is for. The raw extension data is
