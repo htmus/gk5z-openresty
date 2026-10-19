@@ -96,6 +96,58 @@ Block 1 aggregates structural lengths and boolean state flags into a dense 25-ch
 | `24` | 1 | Bool (`t`/`f`) | Active TLS context uses a **Session Ticket** (`t` = true, `f` = false) |
 
 
+
+## Lua API Extensions
+
+The custom C-modules inject a high-performance, native method into the standard OpenResty `shared.dict` metatable. This allows lock-free prefix matching directly on the shared memory RB-tree without pulling the entire dictionary into Lua, which is critical for high-RPS production WAF environments.
+
+### `ngx.shared.DICT:get_by_prefix`
+**Syntax:** `results, err = ngx.shared.shm_name:get_by_prefix(prefix_string)`
+
+* **Arguments:** `prefix_string` (string) — The lookup key prefix (e.g., `"an:ip_hex:"` or `"v1_drv_rules:"`).
+* **Returns:** 
+  * `results` — A native Lua table containing all matching key-value pairs under the prefix (empty table if no matches found).
+  * `err` — Error string if the operation fails.
+
+#### Production Usage Examples
+
+##### Example 1: Bulk Anomaly Counter Retrieval for IP (from `client_hello.lua`)
+```lua
+local an_shm = ngx.shared.anomaly_counters
+
+-- Atomically retrieve all active anomaly counters for the client IP in a single call
+local prefix = "an:" .. ip_hex .. ":"
+local anomalies, err_shm = an_shm:get_by_prefix(prefix)
+
+if not anomalies then
+    logger.log(logger.LEVELS.ERROR, "[HELO_BY_LUA] Anomalies: get_by_prefix IP " .. ip .. " failed: ", tostring(err_shm))
+    return nil, nil
+end
+
+-- Next(t) is the fastest non-allocating way in LuaJIT to check if a table contains any records
+if next(anomalies) then
+    -- Anomalies found, execute active policy thresholds loop
+    for reason_id, count in pairs(anomalies) do
+        local rule_key = level_prefix .. reason_id
+        local rule = settings.get('sslerr', rule_key)
+        -- ... execute mitigation rules (Penalty, Block, etc.) ...
+    end
+end
+```
+
+##### Example 2: Dynamic Core Configuration / Rules Routing
+```lua
+-- Form prefix mask for the active engine configuration version
+local prefix = "v" .. tostring(active_config_index) .. "_" .. block
+
+if block == 'drv_rules' then
+    -- Fetches raw values array for the dynamic driver routing table via single prefix lookup
+    local raw_value = cache:get_by_prefix(prefix .. ":")
+    return raw_value
+end
+```
+
+
 ## Installation & Compilation Guide
 
 ### 1. Prerequisites (System Packages)
