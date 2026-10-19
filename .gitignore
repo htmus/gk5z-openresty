@@ -1,8 +1,12 @@
-# Игнорируем любые директории и файлы бэкапов диффов
+# =======================================================
+# GK5Z Engine Core Git Isolation Rules
+# =======================================================
+
+# Ignore local source diffs and scratchpads
 *_diff/
 *_diff
 
-# Системные файлы и временные файлы редакторов
+# Editor swap files and artifacts
 *~
 *.swp
 *.bak
