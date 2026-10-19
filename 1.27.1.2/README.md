@@ -96,6 +96,23 @@ Block 1 aggregates structural lengths and boolean state flags into a dense 25-ch
 | `24` | 1 | Bool (`t`/`f`) | Active TLS context uses a **Session Ticket** (`t` = true, `f` = false) |
 
 
+## Exported Raw TLS Variables (Nginx Core Layer)
+
+In addition to the generated `GK5Z` string, the C-infrastructure patch dynamically populates native Nginx variables with raw, unsorted ClientHello attributes. These variables are directly accessible via `ngx.var` in your Lua scripts for deep traffic inspection and browser mimicry verification.
+
+| Nginx Variable | Format | Description / Example |
+| :--- | :--- | :--- |
+| `$http_gk5z_gk5z` | String | The full 12-block GK5Z fingerprint string. |
+| `$http_gk5z_client_extn` | Hex-List | Raw comma-separated list of client extensions (including GREASE). <br>*Example:* `6a6a,000a,0012,ff01,000b...` |
+| `$http_gk5z_client_ciph` | Hex-List | Raw comma-separated list of offered cipher suites. <br>*Example:* `1301,1302,1303,c02b,c02f...` |
+| `$http_gk5z_tls_supp_ver` | Hex-List | Supported TLS versions extracted from the extension. <br>*Example:* `0303,0304` (TLS 1.2, TLS 1.3) |
+| `$http_gk5z_tls_supp_groups`| Hex-List | Offered elliptic curves / supported groups. <br>*Example:* `8a8a,11ec,001d,0017...` |
+| `$http_gk5z_client_algs` | Hex-List | Offered Signature Algorithms. <br>*Example:* `eaea,0904,0905,0906...` |
+| `$http_gk5z_client_alpn` | String | Offered ALPN protocols. <br>*Example:* `h2,http/1.1` |
+| `$http_gk5z_random` | Hex (64c) | The full **32-byte Client Random** payload. <br>*Example:* `e84b702a5a89c2dd934f3ca3c3a0d293...` |
+| `$ngx_gk5z_tls_psk_modes` | Hex (2c) | Count and codes of PSK key exchange modes. <br>*Example:* `01` |
+| `$http_gk5z_SNI` | String | Extracted Server Name Indication host. <br>*Example:* `superpc.ru` (or `1` if matched) |
+
 
 ## Lua API Extensions
 
